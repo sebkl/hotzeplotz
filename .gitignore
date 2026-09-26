@@ -1,0 +1,9 @@
+# Binaries
+testserver
+
+# Local sensitive configuration
+config.mk
+
+# OS & Editor
+.DS_Store
+*.swp

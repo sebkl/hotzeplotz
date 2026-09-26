@@ -1,0 +1,15 @@
+# Example configuration file
+# Copy this file to config.mk and fill in your values:
+#   cp config.mk.example config.mk
+
+PROJECT_ID := my-gcp-project
+REGION := europe-west1
+FUNCTION_NAME := update-dns
+
+# Client update settings
+UPDATE_HOST := home.example.com
+UPDATE_TOKEN := your-secret-token
+UPDATE_MANAGED_ZONE := 
+
+# Deployment target for client script
+DEPLOY_TARGET := root@192.168.1.100:bin/

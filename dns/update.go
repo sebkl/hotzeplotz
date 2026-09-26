@@ -6,22 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
-	"time"
 
+	"github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
 	"google.golang.org/api/dns/v1"
 	"google.golang.org/api/option"
+
+	"cloud.google.com/go/compute/metadata"
 )
 
-// DefaultTTL is the default time-to-live for DNS records in seconds (5 minutes).
-const DefaultTTL int64 = 300
+const (
+	// DefaultTTL is the default time-to-live for DNS records in seconds (5 minutes).
+	DefaultTTL int64 = 300
+
+	defaultManagedZone = "sebi-wan-kenobi-org"
+)
 
 // Options contains configurable settings for updating a Cloud DNS record.
 type Options struct {
-	IP            string
+	IPs           []net.IP
 	ProjectID     string
 	ManagedZone   string
 	TTL           int64
@@ -32,10 +40,23 @@ type Options struct {
 // Option is a functional option for configuring UpdateWithOptions.
 type Option func(*Options)
 
-// WithIP specifies the target IPv4 address for the DNS record.
-func WithIP(ip string) Option {
+// WithIP specifies a target IP address for the DNS record.
+func WithIP(ip net.IP) Option {
 	return func(o *Options) {
-		o.IP = ip
+		if ip != nil {
+			o.IPs = append(o.IPs, ip)
+		}
+	}
+}
+
+// WithIPs specifies multiple target IP addresses for the DNS record.
+func WithIPs(ips ...net.IP) Option {
+	return func(o *Options) {
+		for _, ip := range ips {
+			if ip != nil {
+				o.IPs = append(o.IPs, ip)
+			}
+		}
 	}
 }
 
@@ -74,7 +95,7 @@ func WithClientOptions(opts ...option.ClientOption) Option {
 	}
 }
 
-// Update updates a Google Cloud DNS A record for the specified hostname using the Google Cloud DNS API.
+// Update updates Google Cloud DNS A and/or AAAA records for the specified hostname using the Google Cloud DNS API.
 //
 // Parameters:
 //   - ctx: Context for network requests and cancellation (defaults to context.Background() if nil).
@@ -83,28 +104,38 @@ func WithClientOptions(opts ...option.ClientOption) Option {
 //   - managedZone: Cloud DNS Managed Zone name. If empty, it is automatically discovered by matching the hostname
 //     against the project's managed zones in Cloud DNS.
 //   - hostname: The target domain name to update (e.g. "home.example.com").
-//   - ip: Optional IPv4 address. If omitted or passed as an empty string, the caller's public IP address
-//     is automatically detected.
-func Update(ctx context.Context, projectID, managedZone, hostname string, ip ...string) error {
-	var targetIP string
-	if len(ip) > 0 {
-		targetIP = ip[0]
+//   - ips: One or more IP addresses (IPv4 and/or IPv6) to set.
+func Update(ctx context.Context, projectID, managedZone, host string, ips ...net.IP) error {
+	var validIPs []net.IP
+	for _, ip := range ips {
+		if ip != nil {
+			validIPs = append(validIPs, ip)
+		}
 	}
-	return UpdateWithOptions(ctx, hostname,
+	if len(validIPs) == 0 {
+		return fmt.Errorf("no ip provided")
+	}
+
+	var ipStrs []string
+	for _, ip := range validIPs {
+		ipStrs = append(ipStrs, ip.String())
+	}
+	log.Printf("Updating IP(s) of %q to %q in zone %q for project %q", host, strings.Join(ipStrs, ", "), managedZone, projectID)
+	return UpdateWithOptions(ctx, host, validIPs,
 		WithProject(projectID),
 		WithZone(managedZone),
-		WithIP(targetIP),
 	)
 }
 
-// UpdateWithOptions updates a Google Cloud DNS A record with advanced configurations and functional options.
-func UpdateWithOptions(ctx context.Context, hostname string, opts ...Option) error {
+// UpdateWithOptions updates Google Cloud DNS A and/or AAAA records with advanced configurations and functional options.
+func UpdateWithOptions(ctx context.Context, host string, ips []net.IP, opts ...Option) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	options := &Options{
 		TTL: DefaultTTL,
+		IPs: ips,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -112,34 +143,28 @@ func UpdateWithOptions(ctx context.Context, hostname string, opts ...Option) err
 		}
 	}
 
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
+	host = strings.TrimSpace(host)
+	if host == "" {
 		return errors.New("hostname cannot be empty")
 	}
-	canonicalName := canonicalizeHostname(hostname)
+	canonicalName := canonicalizeHostname(host)
 
-	// 1. Resolve Target IP address
-	targetIP := strings.TrimSpace(options.IP)
-	if targetIP == "" {
-		callerIP, err := GetCallerIP(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to detect caller IP: %w", err)
+	var validIPs []net.IP
+	for _, ip := range options.IPs {
+		if ip != nil {
+			validIPs = append(validIPs, ip)
 		}
-		targetIP = callerIP
 	}
-
-	// Validate IPv4 format
-	parsedIP := net.ParseIP(targetIP)
-	if parsedIP == nil || parsedIP.To4() == nil {
-		return fmt.Errorf("invalid IPv4 address %q for DNS A record", targetIP)
+	if len(validIPs) == 0 {
+		return errors.New("no ip provided")
 	}
-	targetIP = parsedIP.To4().String()
 
 	// 2. Resolve Project ID
-	projectID, err := detectProjectID(options.ProjectID)
+	projectID, err := detectProjectID(ctx, options.ProjectID)
 	if err != nil {
 		return err
 	}
+	log.Printf("Resolved project ID: %s", projectID)
 
 	// 3. Initialize Google Cloud DNS Service Client if not provided
 	dnsSrv := options.Service
@@ -158,11 +183,7 @@ func UpdateWithOptions(ctx context.Context, hostname string, opts ...Option) err
 	// 4. Resolve Managed Zone if not provided
 	managedZone := strings.TrimSpace(options.ManagedZone)
 	if managedZone == "" {
-		discoveredZone, err := FindManagedZone(ctx, dnsSrv, projectID, canonicalName)
-		if err != nil {
-			return err
-		}
-		managedZone = discoveredZone
+		return errors.New("managed zone cannot be empty")
 	}
 
 	ttl := options.TTL
@@ -170,62 +191,181 @@ func UpdateWithOptions(ctx context.Context, hostname string, opts ...Option) err
 		ttl = DefaultTTL
 	}
 
-	newRecord := &dns.ResourceRecordSet{
-		Name:    canonicalName,
-		Type:    "A",
-		Ttl:     ttl,
-		Rrdatas: []string{targetIP},
+	var aRrdatas []string
+	var aaaaRrdatas []string
+
+	for _, ip := range validIPs {
+		if ip.To4() == nil {
+			log.Printf("IPv6 address detected: %s", ip.String())
+			aaaaRrdatas = append(aaaaRrdatas, ip.String())
+
+			addr, err := netip.ParseAddr(ip.String())
+			if err == nil && addr.Is4In6() {
+				log.Printf("IPv4 mapped IPv6 detected: %s", ip.String())
+				aRrdatas = append(aRrdatas, addr.Unmap().String())
+			}
+		} else {
+			log.Printf("IPv4 address detected: %s", ip.String())
+			aRrdatas = append(aRrdatas, ip.String())
+		}
 	}
 
-	// 5. Query existing A record for this hostname using Cloud DNS API
-	listResp, err := dnsSrv.ResourceRecordSets.List(projectID, managedZone).Name(canonicalName).Type("A").Context(ctx).Do()
+	var records []*dns.ResourceRecordSet
+	if len(aRrdatas) > 0 {
+		records = append(records, &dns.ResourceRecordSet{
+			Name:    canonicalName,
+			Type:    "A",
+			Ttl:     ttl,
+			Rrdatas: aRrdatas,
+		})
+	}
+	if len(aaaaRrdatas) > 0 {
+		records = append(records, &dns.ResourceRecordSet{
+			Name:    canonicalName,
+			Type:    "AAAA",
+			Ttl:     ttl,
+			Rrdatas: aaaaRrdatas,
+		})
+	}
+
+	// 5. Query existing record for this hostname using Cloud DNS API
+	listResp, err := dnsSrv.ResourceRecordSets.List(projectID, managedZone).Name(canonicalName).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("failed to query DNS record sets for %s in zone %s: %w", canonicalName, managedZone, err)
 	}
 
-	var existingRecord *dns.ResourceRecordSet
+	var deletions []*dns.ResourceRecordSet
 	for _, rr := range listResp.Rrsets {
-		if canonicalizeHostname(rr.Name) == canonicalName && rr.Type == "A" {
-			existingRecord = rr
-			break
+		if canonicalizeHostname(rr.Name) == canonicalName && (rr.Type == "A" || rr.Type == "AAAA") {
+			deletions = append(deletions, rr)
 		}
 	}
 
 	// If record already exists with identical IP and TTL, no change is necessary
-	if existingRecord != nil {
-		if existingRecord.Ttl == ttl && len(existingRecord.Rrdatas) == 1 && existingRecord.Rrdatas[0] == targetIP {
+	if len(deletions) == len(records) {
+		allMatch := true
+		for _, rec := range records {
+			matched := false
+			for _, existing := range deletions {
+				if existing.Type == rec.Type && existing.Ttl == rec.Ttl &&
+					canonicalizeHostname(existing.Name) == canonicalizeHostname(rec.Name) &&
+					slicesEqual(existing.Rrdatas, rec.Rrdatas) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			log.Printf("DNS records for %s are already up to date, skipping change", canonicalName)
 			return nil
 		}
 	}
 
 	// 6. Build atomic Change for Cloud DNS API
 	change := &dns.Change{
-		Additions: []*dns.ResourceRecordSet{newRecord},
-	}
-	if existingRecord != nil {
-		change.Deletions = []*dns.ResourceRecordSet{existingRecord}
+		Additions: records,
+		Deletions: deletions,
 	}
 
 	// 7. Apply change via Google Cloud DNS Changes API
+	var ipStrings []string
+	for _, ip := range validIPs {
+		ipStrings = append(ipStrings, ip.String())
+	}
+	log.Printf("Applying DNS change for %s (%s) in zone %s: %+v", canonicalName, strings.Join(ipStrings, ", "), managedZone, change)
 	_, err = dnsSrv.Changes.Create(projectID, managedZone, change).Context(ctx).Do()
 	if err != nil {
-		return fmt.Errorf("failed to apply DNS change for %s (%s) in zone %s: %w", canonicalName, targetIP, managedZone, err)
+		return fmt.Errorf("failed to apply DNS change for %s (%s) in zone %s: %w", canonicalName, strings.Join(ipStrings, ", "), managedZone, err)
 	}
 
 	return nil
 }
 
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // UpdateHTTP is the entrypoint handler for Google Cloud Functions (HTTP trigger).
-// It handles HTTP requests, verifies authentication (if configured via AUTH_TOKEN),
-// parses the hostname and IP parameters from query parameters or JSON body,
-// automatically extracts the caller's IP from the request headers if omitted,
-// and invokes the Google Cloud DNS Update function.
+// It only accepts HTTP POST requests with a JSON body or form parameters, verifies authentication
+// (if configured via AUTH_TOKEN), extracts the hostname and target IP(s), and invokes Update.
 func UpdateHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// 1. Verify Authentication if AUTH_TOKEN is set in the environment
+	// 1. Only allow HTTP POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed: only POST requests are accepted", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 2. Parse JSON body (if provided) and/or Form values
+	var payload struct {
+		Host        string `json:"host"`
+		Hostname    string `json:"hostname"`
+		IPv4        string `json:"ipv4"`
+		IPv6        string `json:"ipv6"`
+		Token       string `json:"token"`
+		ManagedZone string `json:"managed_zone"`
+		ProjectID   string `json:"project_id"`
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(strings.ToLower(contentType), "application/json") || (r.Body != nil && r.ContentLength > 0 && !strings.Contains(contentType, "application/x-www-form-urlencoded")) {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10240))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Bad Request: failed to read body: %v", err), http.StatusBadRequest)
+			return
+		}
+		if len(strings.TrimSpace(string(bodyBytes))) > 0 {
+			if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+				http.Error(w, fmt.Sprintf("Bad Request: invalid JSON body: %v", err), http.StatusBadRequest)
+				return
+			}
+		}
+	} else if r.Body != nil {
+		_ = r.ParseForm()
+	}
+
+	// Also fallback to URL Query / Form values if fields are unset
+	if payload.Host == "" {
+		payload.Host = r.FormValue("host")
+	}
+	if payload.Host == "" {
+		payload.Host = r.FormValue("hostname")
+	}
+	if payload.Host == "" && payload.Hostname != "" {
+		payload.Host = payload.Hostname
+	}
+	if payload.IPv4 == "" {
+		payload.IPv4 = r.FormValue("ipv4")
+	}
+	if payload.IPv6 == "" {
+		payload.IPv6 = r.FormValue("ipv6")
+	}
+	if payload.Token == "" {
+		payload.Token = r.FormValue("token")
+	}
+	if payload.ManagedZone == "" {
+		payload.ManagedZone = r.FormValue("managed_zone")
+	}
+	if payload.ProjectID == "" {
+		payload.ProjectID = r.FormValue("project_id")
+	}
+
+	// 3. Verify Authentication if AUTH_TOKEN is set in the environment
 	if expectedToken := strings.TrimSpace(os.Getenv("AUTH_TOKEN")); expectedToken != "" {
-		token := strings.TrimSpace(r.URL.Query().Get("token"))
+		token := strings.TrimSpace(payload.Token)
 		if token == "" {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
@@ -233,7 +373,6 @@ func UpdateHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if token == "" {
-			// Support HTTP Basic Authentication (common with DDNS clients like Fritz!Box / ddclient)
 			_, pass, ok := r.BasicAuth()
 			if ok && pass != "" {
 				token = pass
@@ -246,118 +385,116 @@ func UpdateHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Parse Hostname and IP from Query parameters, Form values, or JSON body
-	hostname := strings.TrimSpace(r.URL.Query().Get("hostname"))
-	if hostname == "" {
-		hostname = strings.TrimSpace(r.URL.Query().Get("host"))
-	}
-	if hostname == "" {
-		hostname = strings.TrimSpace(r.URL.Query().Get("domain"))
-	}
-
-	ip := strings.TrimSpace(r.URL.Query().Get("ip"))
-	if ip == "" {
-		ip = strings.TrimSpace(r.URL.Query().Get("myip"))
-	}
-	if ip == "" {
-		ip = strings.TrimSpace(r.URL.Query().Get("ipv4"))
-	}
-
-	// If not in query params, inspect form or JSON payload
-	if r.Method == http.MethodPost || r.Method == http.MethodPut {
-		contentType := r.Header.Get("Content-Type")
-		if strings.Contains(contentType, "application/json") {
-			var body struct {
-				Hostname string `json:"hostname"`
-				Host     string `json:"host"`
-				Domain   string `json:"domain"`
-				IP       string `json:"ip"`
-				MyIP     string `json:"myip"`
-			}
-			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10240))
-			if err == nil && len(bodyBytes) > 0 {
-				if err := json.Unmarshal(bodyBytes, &body); err == nil {
-					if hostname == "" {
-						if body.Hostname != "" {
-							hostname = body.Hostname
-						} else if body.Host != "" {
-							hostname = body.Host
-						} else {
-							hostname = body.Domain
-						}
-					}
-					if ip == "" {
-						if body.IP != "" {
-							ip = body.IP
-						} else {
-							ip = body.MyIP
-						}
-					}
-				}
-			}
-		} else {
-			if hostname == "" {
-				hostname = strings.TrimSpace(r.FormValue("hostname"))
-			}
-			if ip == "" {
-				ip = strings.TrimSpace(r.FormValue("ip"))
-				if ip == "" {
-					ip = strings.TrimSpace(r.FormValue("myip"))
-				}
-			}
-		}
-	}
-
-	hostname = strings.TrimSpace(hostname)
-	if hostname == "" {
-		http.Error(w, "Missing required 'hostname' parameter", http.StatusBadRequest)
+	// 4. Resolve Hostname
+	host := strings.TrimSpace(payload.Host)
+	if host == "" {
+		http.Error(w, "Bad Request: missing required 'host' in JSON body or POST params", http.StatusBadRequest)
 		return
 	}
 
-	// 3. If IP address is not specified by the caller, extract it from the HTTP request headers
-	if ip == "" {
-		ip = extractCallerIP(r)
+	// 5. Resolve Target IP address(es)
+	var targetIPs []net.IP
+
+	// Check if explicit IPv4 is provided
+	if ipv4Str := strings.TrimSpace(payload.IPv4); ipv4Str != "" {
+		parsedIPv4 := net.ParseIP(ipv4Str)
+		if parsedIPv4 == nil || parsedIPv4.To4() == nil {
+			http.Error(w, fmt.Sprintf("Bad Request: invalid IPv4 address %q", ipv4Str), http.StatusBadRequest)
+			return
+		}
+		targetIPs = append(targetIPs, parsedIPv4)
 	}
 
-	// 4. Update DNS record in Google Cloud DNS
-	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	// Check if explicit IPv6 is provided
+	if ipv6Str := strings.TrimSpace(payload.IPv6); ipv6Str != "" {
+		parsedIPv6 := net.ParseIP(ipv6Str)
+		if parsedIPv6 == nil || parsedIPv6.To4() != nil {
+			http.Error(w, fmt.Sprintf("Bad Request: invalid IPv6 address %q", ipv6Str), http.StatusBadRequest)
+			return
+		}
+		targetIPs = append(targetIPs, parsedIPv6)
+	}
+
+	// If no IP was specified at all, fallback to extracting caller's IP
+	if len(targetIPs) == 0 {
+		callerIP := extractCallerIP(r)
+		if callerIP == nil {
+			http.Error(w, "IP could not be determined", http.StatusInternalServerError)
+			return
+		}
+		targetIPs = append(targetIPs, callerIP)
+	}
+
+	// 6. Update DNS record in Google Cloud DNS
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID == "" {
+		projectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
+	}
 	if projectID == "" {
 		projectID = os.Getenv("GCP_PROJECT")
 	}
-	managedZone := os.Getenv("MANAGED_ZONE")
+	managedZone := strings.TrimSpace(payload.ManagedZone)
+	if managedZone == "" {
+		managedZone = os.Getenv("MANAGED_ZONE")
+	}
+	if managedZone == "" {
+		managedZone = defaultManagedZone
+	}
 
-	err := Update(ctx, projectID, managedZone, hostname, ip)
+	err := Update(ctx, projectID, managedZone, host, targetIPs...)
 	if err != nil {
-		if strings.Contains(err.Error(), "invalid IPv4 address") || strings.Contains(err.Error(), "hostname cannot be empty") {
-			http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
-			return
-		}
+		log.Printf("Failed to update DNS record: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to update DNS record: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	resp := map[string]interface{}{
+		"status": "OK",
+		"host":   host,
+	}
+	var ipStrs []string
+	for _, tip := range targetIPs {
+		ipStrs = append(ipStrs, tip.String())
+		if tip.To4() != nil {
+			resp["ipv4"] = tip.String()
+		} else {
+			resp["ipv6"] = tip.String()
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "OK: Updated %s to %s\n", hostname, ip)
+	json.NewEncoder(w).Encode(resp)
 }
 
-// extractCallerIP extracts the client's public IPv4 address from HTTP request headers.
-func extractCallerIP(r *http.Request) string {
+// extractCallerIP extracts the client's public IP address (IPv4 or IPv6) from HTTP request headers.
+func extractCallerIP(r *http.Request) net.IP {
 	// 1. Check X-Forwarded-For (standard for Cloud Functions, Cloud Run, and HTTP load balancers)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
 		for _, part := range ips {
 			clientIP := strings.TrimSpace(part)
-			if parsed := net.ParseIP(clientIP); parsed != nil && parsed.To4() != nil {
-				return parsed.To4().String()
+			if host, _, err := net.SplitHostPort(clientIP); err == nil {
+				clientIP = host
+			}
+			clientIP = strings.Trim(clientIP, "[]")
+			if parsed := net.ParseIP(clientIP); parsed != nil {
+				log.Printf("Using X-Forwarded-For IP %s", parsed.String())
+				return parsed
 			}
 		}
 	}
 
 	// 2. Check X-Real-IP
 	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		if parsed := net.ParseIP(xrip); parsed != nil && parsed.To4() != nil {
-			return parsed.To4().String()
+		clientIP := xrip
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+		clientIP = strings.Trim(clientIP, "[]")
+		if parsed := net.ParseIP(clientIP); parsed != nil {
+			log.Printf("Using X-Real-IP IP %s", parsed.String())
+			return parsed
 		}
 	}
 
@@ -367,114 +504,17 @@ func extractCallerIP(r *http.Request) string {
 		if err != nil {
 			host = r.RemoteAddr
 		}
-		if parsed := net.ParseIP(host); parsed != nil && parsed.To4() != nil {
-			return parsed.To4().String()
+		host = strings.Trim(host, "[]")
+		if parsed := net.ParseIP(host); parsed != nil {
+			log.Printf("Using remote addr %q", r.RemoteAddr)
+			return parsed
 		}
 	}
-
-	return ""
+	log.Printf("No IP address found.")
+	return nil
 }
 
-// GetCallerIP detects the current public IPv4 address of the caller using Google DNS.
-func GetCallerIP(ctx context.Context) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	// Method 1: Query Google's authoritative DNS nameservers for TXT o-o.myaddr.l.google.com
-	googleNameservers := []string{
-		"ns1.google.com:53",
-		"ns2.google.com:53",
-		"ns3.google.com:53",
-		"ns4.google.com:53",
-		"216.239.32.10:53",
-		"216.239.34.10:53",
-	}
-
-	for _, ns := range googleNameservers {
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(dialCtx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 3 * time.Second}
-				return d.DialContext(dialCtx, "udp", ns)
-			},
-		}
-
-		txtRecords, err := resolver.LookupTXT(ctx, "o-o.myaddr.l.google.com")
-		if err != nil || len(txtRecords) == 0 {
-			continue
-		}
-
-		for _, txt := range txtRecords {
-			txt = strings.Trim(txt, `" `)
-			parsed := net.ParseIP(txt)
-			if parsed != nil && parsed.To4() != nil {
-				return parsed.To4().String(), nil
-			}
-		}
-	}
-
-	// Method 2: Google Public DNS over HTTPS (DoH) API fallback (dns.google)
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://dns.google/resolve?name=o-o.myaddr.l.google.com&type=TXT", nil)
-	if err == nil {
-		req.Header.Set("Accept", "application/dns-json")
-		resp, err := client.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				var result struct {
-					Answer []struct {
-						Data string `json:"data"`
-					} `json:"Answer"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&result) == nil {
-					for _, ans := range result.Answer {
-						clean := strings.Trim(ans.Data, `" `)
-						parsed := net.ParseIP(clean)
-						if parsed != nil && parsed.To4() != nil {
-							return parsed.To4().String(), nil
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return "", errors.New("failed to detect caller public IP address via Google DNS")
-}
-
-// FindManagedZone discovers the appropriate managed zone in a GCP project that hosts the given hostname
-// using the Google Cloud DNS ManagedZones API.
-func FindManagedZone(ctx context.Context, srv *dns.Service, projectID, hostname string) (string, error) {
-	canonical := canonicalizeHostname(hostname)
-	req := srv.ManagedZones.List(projectID)
-	var matchedZone string
-	var longestMatchLen int
-
-	err := req.Pages(ctx, func(resp *dns.ManagedZonesListResponse) error {
-		for _, zone := range resp.ManagedZones {
-			zoneDNS := canonicalizeHostname(zone.DnsName)
-			if strings.HasSuffix(canonical, zoneDNS) {
-				if len(zoneDNS) > longestMatchLen {
-					longestMatchLen = len(zoneDNS)
-					matchedZone = zone.Name
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to list managed zones in project %q: %w", projectID, err)
-	}
-
-	if matchedZone == "" {
-		return "", fmt.Errorf("no managed zone found in project %q matching hostname %q", projectID, hostname)
-	}
-	return matchedZone, nil
-}
-
-func detectProjectID(projectID string) (string, error) {
+func detectProjectID(ctx context.Context, projectID string) (string, error) {
 	if val := strings.TrimSpace(projectID); val != "" {
 		return val, nil
 	}
@@ -483,7 +523,12 @@ func detectProjectID(projectID string) (string, error) {
 			return val, nil
 		}
 	}
-	return "", errors.New("Google Cloud Project ID is not specified and could not be detected from environment (GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT, GCP_PROJECT)")
+	if metadata.OnGCE() {
+		if pid, err := metadata.ProjectIDWithContext(ctx); err == nil && strings.TrimSpace(pid) != "" {
+			return strings.TrimSpace(pid), nil
+		}
+	}
+	return "", errors.New("Google Cloud Project ID is not specified and could not be detected from environment (GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT, GCP_PROJECT) or GCP metadata server")
 }
 
 func canonicalizeHostname(hostname string) string {
@@ -492,4 +537,8 @@ func canonicalizeHostname(hostname string) string {
 		h += "."
 	}
 	return h
+}
+
+func init() {
+	funcframework.RegisterHTTPFunction("/", UpdateHTTP)
 }
