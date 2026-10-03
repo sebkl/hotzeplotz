@@ -1,5 +1,7 @@
 # Binaries
-testserver
+./testserver
+./tokengen
+./dns/tokengen
 
 # Local sensitive configuration
 config.mk
@@ -7,3 +9,4 @@ config.mk
 # OS & Editor
 .DS_Store
 *.swp
+*.token

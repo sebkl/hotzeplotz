@@ -10,6 +10,8 @@ FUNCTION_NAME := update-dns
 UPDATE_HOST := home.example.com
 UPDATE_TOKEN := your-secret-token
 UPDATE_MANAGED_ZONE := 
+KMS_SIGN_KEYNAME := my-key-name
+KMS_KINGRING := my-key-ring-name
 
 # Deployment target for client script
 DEPLOY_TARGET := root@192.168.1.100:bin/

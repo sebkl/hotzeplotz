@@ -22,6 +22,5 @@ make deploy
 
 ## TODO
 
-*  Make the token secure and actually use it.
 *  Cleanup AI nonesense.
 *  Add infrastructure to allow certain secrets only to update certain hostnames (plural).

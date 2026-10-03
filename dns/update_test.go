@@ -15,6 +15,21 @@ import (
 	"google.golang.org/api/option"
 )
 
+func init() {
+	os.Setenv("KMS_SIGN_KEYNAME", "projects/test/locations/global/keyRings/test/cryptoKeys/test/cryptoKeyVersions/1")
+	validateTokenFunc = func(w http.ResponseWriter, r *http.Request, kmsKeyName, token, host string) bool {
+		if token != "secret-key-123" {
+			http.Error(w, "Unauthorized: token validation failed", http.StatusUnauthorized)
+			return false
+		}
+		if host != "" && host != "home.example.com" {
+			http.Error(w, "Unauthorized: host not allowed by token", http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+}
+
 func TestCanonicalizeHostname(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -233,7 +248,7 @@ func TestUpdateHTTP_Authentication(t *testing.T) {
 }
 
 func TestUpdateHTTP_MissingHost(t *testing.T) {
-	body := []byte(`{}`)
+	body := []byte(`{"token": "secret-key-123"}`)
 	req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(body))
 	req.Header.Set("X-Forwarded-For", "198.51.100.25")
 	rec := httptest.NewRecorder()
@@ -244,7 +259,7 @@ func TestUpdateHTTP_MissingHost(t *testing.T) {
 }
 
 func TestUpdateHTTP_InvalidPayloadIP(t *testing.T) {
-	body := []byte(`{"host": "home.example.com", "ipv4": "999.999.999.999"}`)
+	body := []byte(`{"host": "home.example.com", "token": "secret-key-123", "ipv4": "999.999.999.999"}`)
 	req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	UpdateHTTP(rec, req)
@@ -254,7 +269,7 @@ func TestUpdateHTTP_InvalidPayloadIP(t *testing.T) {
 }
 
 func TestUpdateHTTP_MissingCallerIP(t *testing.T) {
-	body := []byte(`{"host": "home.example.com"}`)
+	body := []byte(`{"host": "home.example.com", "token": "secret-key-123"}`)
 	req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(body))
 	req.RemoteAddr = ""
 	rec := httptest.NewRecorder()
@@ -267,7 +282,7 @@ func TestUpdateHTTP_MissingCallerIP(t *testing.T) {
 
 func TestUpdateHTTP_DualStack(t *testing.T) {
 	// 1. Valid JSON body with both ipv4 and ipv6
-	body := []byte(`{"host": "home.example.com", "ipv4": "198.51.100.1", "ipv6": "2001:db8::1"}`)
+	body := []byte(`{"host": "home.example.com", "token": "secret-key-123", "ipv4": "198.51.100.1", "ipv6": "2001:db8::1"}`)
 	req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -278,7 +293,7 @@ func TestUpdateHTTP_DualStack(t *testing.T) {
 	}
 
 	// 2. Invalid IPv4 in ipv4 field (passing an IPv6)
-	bodyInvalidV4 := []byte(`{"host": "home.example.com", "ipv4": "2001:db8::1"}`)
+	bodyInvalidV4 := []byte(`{"host": "home.example.com", "token": "secret-key-123", "ipv4": "2001:db8::1"}`)
 	reqInvalidV4 := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(bodyInvalidV4))
 	recInvalidV4 := httptest.NewRecorder()
 	UpdateHTTP(recInvalidV4, reqInvalidV4)
@@ -287,7 +302,7 @@ func TestUpdateHTTP_DualStack(t *testing.T) {
 	}
 
 	// 3. Invalid IPv6 in ipv6 field (passing an IPv4)
-	bodyInvalidV6 := []byte(`{"host": "home.example.com", "ipv6": "198.51.100.1"}`)
+	bodyInvalidV6 := []byte(`{"host": "home.example.com", "token": "secret-key-123", "ipv6": "198.51.100.1"}`)
 	reqInvalidV6 := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(bodyInvalidV6))
 	recInvalidV6 := httptest.NewRecorder()
 	UpdateHTTP(recInvalidV6, reqInvalidV6)
@@ -296,7 +311,7 @@ func TestUpdateHTTP_DualStack(t *testing.T) {
 	}
 
 	// 4. Form urlencoded POST with both ipv4 and ipv6
-	formBody := strings.NewReader("host=home.example.com&ipv4=198.51.100.1&ipv6=2001:db8::1")
+	formBody := strings.NewReader("host=home.example.com&token=secret-key-123&ipv4=198.51.100.1&ipv6=2001:db8::1")
 	reqForm := httptest.NewRequest(http.MethodPost, "/update", formBody)
 	reqForm.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	recForm := httptest.NewRecorder()

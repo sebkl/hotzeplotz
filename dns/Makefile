@@ -1,7 +1,10 @@
+-include ../config.mk
+
 # Toolchain configuration
 GO ?= go
 GCLOUD ?= gcloud
 BIN := testserver
+TOKENGEN_BIN := tokengen
 
 # Cloud Function deployment settings
 RUNTIME ?= go127
@@ -12,11 +15,12 @@ PROJECT_ID ?= change-project-id
 UPDATE_TOKEN ?= "MY_SECRET_TOKEN"
 
 UPDATE_URL := "https://$(REGION)-$(PROJECT_ID).cloudfunctions.net/$(FUNCTION_NAME)
+KMS_SIGN_KEY_RESOURCE ?= "projects/$(PROJECT_ID)/locations/$(REGION)/keyRings/$(KMS_KEYRING)/cryptoKeys/$(KMS_SIGN_KEYNAME)/cryptoKeyVersions/1"
 
 # List of all Go packages in the repository
 PKGS := $(shell $(GO) list ./... | grep -v /vendor/)
 
-.PHONY: all build help test test-coverage lint fmt vet tidy benchmark clean testerver run run_update dploy deploy_update dploy_cf
+.PHONY: all build help test test-coverage lint fmt vet tidy benchmark clean create_keys run_testerver run run_update dploy deploy_update dploy_cf tokens
 
 # Default target runs formatting checks, static analysis, and tests
 all: fmt vet lint build test
@@ -63,16 +67,55 @@ tidy:
 
 ## clean: Remove temporary test reports and build artifacts
 clean:
-	rm -f coverage.out coverage.html
+	rm -f coverage.out coverage.html $(TOKENGEN_BIN)
 	$(GO) clean
 
-## build: build all go packages
-build:
+$(BIN):
 	cd testing/ && $(GO) build -o $(BIN) ./dnsserver.go
+
+$(TOKENGEN_BIN):
+	$(GO) build -o $(TOKENGEN_BIN) ./cmd/tokengen
+
+## build: build all go packages
+build: $(BIN)
 	$(GO) build $(PKGS)
 
+
+## Create all keys
+create_keys: $(KMS_SIGN_KEYNAME)
+
+## Make sure the keyring is created in KMS
+$(KMS_KEYRING):
+	@if $(GCLOUD) kms keyrings describe $(KMS_KEYRING) --location $(REGION) > /dev/null 2>&1; then \
+		echo "KeyRing $(KMS_KEYRING) already exists."; \
+	else \
+		$(GCLOUD) kms keyrings create $(KMS_KEYRING) \
+			--location $(REGION); \
+	fi
+
+## Make sure the signing key is created in KMS
+$(KMS_SIGN_KEYNAME): $(KMS_KEYRING)
+	@if $(GCLOUD) kms keys describe $(KMS_SIGN_KEYNAME) --location $(REGION) --keyring $(KMS_KEYRING) > /dev/null 2>&1; then \
+		echo "Key $(KMS_SIGN_KEYNAME) already exists."; \
+	else \
+		$(GCLOUD) kms keys create $(KMS_SIGN_KEYNAME) \
+			--location $(REGION) \
+			--keyring $(KMS_KEYRING) \
+			--purpose asymmetric-signing \
+			--default-algorithm rsa-sign-pkcs1-4096-sha256 \
+			--protection-level hsm; \
+	fi
+
+## Generate all tokens
+tokens: $(UPDATE_HOST).token
+
+## Generate a token for the update host
+$(UPDATE_HOST).token: $(KMS_SIGN_KEYNAME) $(TOKENGEN_BIN)
+	$(TOKENGEN_BIN) --key "$(KMS_SIGN_KEY_RESOURCE)" --hosts "$(UPDATE_HOST)" > $@ 
+	chmod 600 $@
+
 ## Build and run local HTTP function server
-testserver: build
+run_testserver: build
 	cd testing && ./$(BIN)
 
 ## Trigger client DNS update check (alias for run_update)
@@ -83,8 +126,9 @@ run_update:
 	./dns/update.sh "$(UPDATE_HOST)" "$(UPDATE_TOKEN)" "$(UPDATE_URL)" "$(UPDATE_MANAGED_ZONE)"
 
 ## Copy update script to remote deployment target
-deploy_update:
-	scp dns/update.sh $(DEPLOY_TARGET)
+deploy_update: $(UPDATE_HOST).token
+	scp update.sh $(DEPLOY_TARGET)
+	scp $(UPDATE_HOST).token $(DEPLOY_TARGET)/$(UPDATE_HOST).token
 
 ## Deploy Cloud Function to Google Cloud
 deploy_cf:
@@ -97,8 +141,7 @@ deploy_cf:
 		--entry-point=$(ENTRY_POINT) \
 		--trigger-http \
 		--allow-unauthenticated \
-		--set-env-vars GOOGLE_CLOUD_PROJECT=$(PROJECT_ID)
+		--set-env-vars GOOGLE_CLOUD_PROJECT=$(PROJECT_ID),KMS_SIGN_KEYNAME=$(KMS_SIGN_KEY_RESOURCE)
 
 ## Deploy both client update script and Cloud Function
 deploy: deploy_update deploy_cf
-

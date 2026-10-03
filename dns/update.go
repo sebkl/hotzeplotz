@@ -2,7 +2,13 @@ package dns
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +18,10 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"time"
 
+	kms "cloud.google.com/go/kms/apiv1"
+	"cloud.google.com/go/kms/apiv1/kmspb"
 	"github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
 	"google.golang.org/api/dns/v1"
 	"google.golang.org/api/option"
@@ -26,6 +35,13 @@ const (
 
 	defaultManagedZone = "sebi-wan-kenobi-org"
 )
+
+// TokenClaims represents the claims enclosed in the token signed/encrypted by KMS.
+type TokenClaims struct {
+	Hostnames []string  `json:"hostnames"`
+	IssuedAt  time.Time `json:"iat"`
+	ExpiresAt time.Time `json:"exp"`
+}
 
 // Options contains configurable settings for updating a Cloud DNS record.
 type Options struct {
@@ -191,8 +207,7 @@ func UpdateWithOptions(ctx context.Context, host string, ips []net.IP, opts ...O
 		ttl = DefaultTTL
 	}
 
-	var aRrdatas []string
-	var aaaaRrdatas []string
+	var aRrdatas, aaaaRrdatas []string
 
 	for _, ip := range validIPs {
 		if ip.To4() == nil {
@@ -363,38 +378,30 @@ func UpdateHTTP(w http.ResponseWriter, r *http.Request) {
 		payload.ProjectID = r.FormValue("project_id")
 	}
 
-	// 3. Verify Authentication if AUTH_TOKEN is set in the environment
-	if expectedToken := strings.TrimSpace(os.Getenv("AUTH_TOKEN")); expectedToken != "" {
-		token := strings.TrimSpace(payload.Token)
-		if token == "" {
-			authHeader := r.Header.Get("Authorization")
-			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-				token = strings.TrimSpace(authHeader[7:])
-			}
-		}
-		if token == "" {
-			_, pass, ok := r.BasicAuth()
-			if ok && pass != "" {
-				token = pass
-			}
-		}
-
-		if token != expectedToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	// 4. Resolve Hostname
 	host := strings.TrimSpace(payload.Host)
 	if host == "" {
 		http.Error(w, "Bad Request: missing required 'host' in JSON body or POST params", http.StatusBadRequest)
 		return
 	}
 
-	// 5. Resolve Target IP address(es)
-	var targetIPs []net.IP
+	kmsKeyName := strings.TrimSpace(os.Getenv("KMS_SIGN_KEYNAME"))
+	if len(kmsKeyName) == 0 {
+		http.Error(w, "Internal Server Error: No key name specified.", http.StatusInternalServerError)
+		return
+	}
 
+	token := strings.TrimSpace(payload.Token)
+	if len(token) == 0 {
+		http.Error(w, "Unauthorized: missing required token", http.StatusUnauthorized)
+		return
+	}
+
+	if !validateTokenFunc(w, r, kmsKeyName, token, host) {
+		// validateTokenFunc already writes the error response
+		return
+	}
+
+	var targetIPs []net.IP
 	// Check if explicit IPv4 is provided
 	if ipv4Str := strings.TrimSpace(payload.IPv4); ipv4Str != "" {
 		parsedIPv4 := net.ParseIP(ipv4Str)
@@ -465,6 +472,107 @@ func UpdateHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
+}
+
+// validateTokenFunc is a package-level variable to allow mocking in tests
+var validateTokenFunc = validateToken
+
+// validateToken verifies the KMS-signed token, returning true if valid.
+func validateToken(w http.ResponseWriter, r *http.Request, kmsKeyName, token, host string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		http.Error(w, "Unauthorized: invalid token format", http.StatusUnauthorized)
+		return false
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		http.Error(w, "Unauthorized: invalid token format", http.StatusUnauthorized)
+		return false
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		http.Error(w, "Unauthorized: invalid token format", http.StatusUnauthorized)
+		return false
+	}
+
+	kmsClient, err := kms.NewKeyManagementClient(r.Context())
+	if err != nil {
+		log.Printf("Failed to create KMS client: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return false
+	}
+	defer kmsClient.Close()
+
+	keyVersionName := kmsKeyName
+	if !strings.Contains(keyVersionName, "/cryptoKeyVersions/") {
+		keyVersionName += "/cryptoKeyVersions/1"
+	}
+
+	pkReq := &kmspb.GetPublicKeyRequest{Name: keyVersionName}
+	pkResp, err := kmsClient.GetPublicKey(r.Context(), pkReq)
+	if err != nil {
+		log.Printf("Failed to get public key: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	block, _ := pem.Decode([]byte(pkResp.Pem))
+	if block == nil {
+		log.Printf("Failed to decode PEM block")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		log.Printf("Failed to parse public key: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		log.Printf("Public key is not RSA")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	hash := sha256.Sum256(payloadBytes)
+	if err := rsa.VerifyPKCS1v15(rsaPub, crypto.SHA256, hash[:], sigBytes); err != nil {
+		log.Printf("Signature verification failed: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	var claims TokenClaims
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		log.Printf("Failed to parse token claims: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	if time.Now().After(claims.ExpiresAt) {
+		http.Error(w, "Unauthorized: token expired", http.StatusUnauthorized)
+		return false
+	}
+
+	if host == "" {
+		http.Error(w, "Bad Request: missing required 'host' in JSON body or POST params", http.StatusBadRequest)
+		return false
+	}
+
+	hostAllowed := false
+	for _, allowedHost := range claims.Hostnames {
+		if host == allowedHost {
+			hostAllowed = true
+			break
+		}
+	}
+
+	if !hostAllowed {
+		http.Error(w, "Unauthorized: host not allowed by token", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 // extractCallerIP extracts the client's public IP address (IPv4 or IPv6) from HTTP request headers.
